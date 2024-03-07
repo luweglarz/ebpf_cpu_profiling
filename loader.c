@@ -10,6 +10,9 @@
 #include <linux/perf_event.h>
 #include "bpf/profile.bpf.skel.h"
 #include "bpf/profile.bpf.h"
+#include "blazesym.h"
+
+static struct blaze_symbolizer *symbolizer;
 
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
 			    int cpu, int group_fd, unsigned long flags)
@@ -48,6 +51,31 @@ static int parse_online_cpu(int **online_cpus){
 	return err;
 }
 
+static void print_stack(pid_t pid, __u64 *stack, __s32 stack_sz){
+	const struct blaze_result *result;
+	const struct blaze_sym *sym;
+	int i, j;
+
+	if (pid) {
+		struct blaze_symbolize_src_process src = {
+			.type_size = sizeof(src),
+			.pid = pid,
+		};
+		result = blaze_symbolize_process_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+	} else {
+		struct blaze_symbolize_src_kernel src = {
+			.type_size = sizeof(src),
+		};
+		result = blaze_symbolize_kernel_abs_addrs(symbolizer, &src, (const uintptr_t *)stack, stack_sz);
+	}
+
+	for (i = 0; i < stack_sz / 8; i++) {
+
+    	sym = &result->syms[i];
+		printf("symbol: %s\n", sym->name);
+	}
+}
+
 static int event_handler(void *_ctx, void *data, size_t size)
 {
 	struct stacktrace_event *event = data;
@@ -59,16 +87,18 @@ static int event_handler(void *_ctx, void *data, size_t size)
 
 	if (event->kstack_sz > 0) {
 		printf("Kernel: %d\n", event->kstack_sz);
-		for (int i = 0; i < event->kstack_sz / 8; i++) 
-		printf("  %d [<%016llx>]\n", i, event->kstack[i]);
+		print_stack(0, event->kstack, event->kstack_sz);
+		// for (int i = 0; i < event->kstack_sz / 8; i++) 
+		// 	printf("  %d [<%016llx>]\n", i, event->kstack[i]);
 	} else {
 		printf("No Kernel Stack\n");
 	}
 
 	if (event->ustack_sz > 0) {
 		printf("Userspace: %d\n", event->ustack_sz);
-		for (int i = 0; i < event->ustack_sz / 8; i++) 
-			printf("  %d [<%016llx>]\n", i, event->ustack[i]);
+		print_stack(event->pid, event->ustack, event->ustack_sz);
+		// for (int i = 0; i < event->ustack_sz / 8; i++) 
+		// 	printf("  %d [<%016llx>]\n", i, event->ustack[i]);
 	} else {
 		printf("No Userspace Stack\n");
 	}
@@ -108,6 +138,13 @@ int main(){
 		goto cleanup;
 	}
 
+	symbolizer = blaze_symbolizer_new();
+	if (!symbolizer) {
+		fprintf(stderr, "Fail to create a symbolizer\n");
+		err = -1;
+		goto cleanup;
+	}
+
 	ring_buf = ring_buffer__new(bpf_map__fd(skel->maps.perf_events), event_handler, NULL, NULL);
 	if (!ring_buf) {
 		err = -1;
@@ -132,7 +169,6 @@ int main(){
 	for (int i = 0; i < max_cpus; i++){
 	 	if (online_cpus[i] == -1)
 	 		continue;
-		printf("open cpu\n");
 		pefd = perf_event_open(&attr, pid, online_cpus[i], -1, PERF_FLAG_FD_CLOEXEC);
 		if (pefd < 0) {
 			fprintf(stderr, "Fail to set up performance monitor on a CPU/Core %d\n", pefd);
@@ -153,7 +189,6 @@ int main(){
 
 cleanup:
 	if (links) {
-		printf("if links\n");
 		for (int i = 0; i < max_cpus; i++){
 			if (online_cpus[i] > -1)
 				bpf_link__destroy(links[online_cpus[i]]);
